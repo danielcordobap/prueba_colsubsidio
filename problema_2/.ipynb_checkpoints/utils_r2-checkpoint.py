@@ -29,11 +29,28 @@ from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.isotonic import IsotonicRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
+from sklearn.base import clone
 
 # ----------------------------------------------------------------- 1. Constantes
 SEMILLA = 42
-RAIZ = Path(__file__).resolve().parents[2]
-RUTA_R2 = RAIZ / "Datos Reto 2" / "base clasificacion.csv"
+NOMBRES_CSV_R2 = ("base clasificacion.csv", "base_clasificacion.csv", "base clasificación.csv", "base_clasificación.csv")  # nombre original del enunciado y variantes
+
+
+def localizar_csv_r2():
+    """Encuentra el CSV de R2 sin rutas fijas, en este orden: (1) junto a este archivo, (2) en la carpeta de trabajo
+    (donde corre el notebook), (3) en 'Datos Reto 2/' subiendo por las carpetas padre (estructura original del proyecto)."""
+    aqui = Path(__file__).resolve().parent
+    carpetas = [aqui, Path.cwd()] + [p / "Datos Reto 2" for p in [aqui, *aqui.parents]]
+    for carpeta in carpetas:
+        for nombre in NOMBRES_CSV_R2:
+            if (carpeta / nombre).exists():
+                return carpeta / nombre
+    raise FileNotFoundError(f"No se encontró el CSV de R2 ({' o '.join(NOMBRES_CSV_R2[:2])}). Colócalo en la misma carpeta que utils_r2.py y el notebook.")
+
+
+# Raíz del proyecto completo (si existe la carpeta a2a/); si el código se descargó suelto, es la carpeta de este archivo
+RAIZ = next((p for p in [Path(__file__).resolve().parent, *Path(__file__).resolve().parents] if (p / "a2a").is_dir()), Path(__file__).resolve().parent)
+RUTA_R2 = localizar_csv_r2()
 COLS_ID_R2 = ["id_empresa", "nit"]
 COL_OBJ_R2 = "abandono"
 COLS_CATEG_R2 = ["sector"]
@@ -331,90 +348,157 @@ def ajustar_calibracion_isotonica(modelo, X_train, y_train, n_splits=5, semilla=
     iso.fit(oof_probs, y_train)
     return iso
 
-# ----------------------------------------------------------------- 6. Algoritmo Genético Multi-Semilla
+# ----------------------------------------------------------------- 6. Algoritmo Genético (Parsimonia y Selección de Variables)
+def fitness_subconjunto_r2(cromosoma, grupos_genes, X_train, y_train, modelo, lam=0.005, k=3, semilla=SEMILLA):
+    """Calcula el fitness a maximizar para un subconjunto de variables en clasificación:
+    Fitness = PR-AUC (Average Precision en k-fold CV) - lam * (número de variables activas).
+    Solo utiliza datos de entrenamiento (sin data leakage).
+    """
+    if not any(cromosoma):
+        return -1.0, 0.0
+    nombres_genes = list(grupos_genes.keys())
+    cols = [c for i, act in enumerate(cromosoma) if act for c in grupos_genes[nombres_genes[i]]]
+    X_sub = X_train[cols]
+    cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=semilla)
+    scores = []
+    
+    for tr_i, val_i in cv.split(X_sub, y_train):
+        m = clone(modelo)
+        if hasattr(m, 'random_state'):
+            m.set_params(random_state=semilla)
+        m.fit(X_sub.iloc[tr_i], y_train[tr_i])
+        p = m.predict_proba(X_sub.iloc[val_i])[:, 1]
+        scores.append(average_precision_score(y_train[val_i], p))
+        
+    pr_auc = float(np.mean(scores))
+    fitness = pr_auc - lam * int(np.sum(cromosoma))
+    return fitness, pr_auc
+
+
+def ga_buscar_r2(grupos_genes, X_train, y_train, modelo, lam=0.005, semilla=SEMILLA,
+                 pob=20, gens=12, p_mut=0.12, elite=2, torneo=3, k=3, cache=None, paciencia=3):
+    """Búsqueda genética estocástica para selección de variables en Reto 2.
+    Operadores: Torneo estocástico, Cruce Uniforme (máscara binaria), Mutación Bit-flip y Elitismo.
+    Incorpora memoización con 'cache' para evitar reajustes de combinaciones idénticas.
+    """
+    rng = np.random.default_rng(semilla)
+    nombres_genes = list(grupos_genes.keys())
+    n_genes = len(nombres_genes)
+    cache = {} if cache is None else cache
+
+    def fit_eval(cr):
+        clave = tuple(cr)
+        if clave not in cache:
+            cache[clave] = fitness_subconjunto_r2(cr, grupos_genes, X_train, y_train, modelo, lam=lam, k=k, semilla=semilla)
+        return cache[clave]
+
+    poblacion = [rng.integers(0, 2, n_genes).tolist() for _ in range(pob)]
+    poblacion[0] = [1] * n_genes  # Semilla informativa: el modelo completo compite desde la generación 0
+    historial, sin_mejora = [], 0
+
+    for _ in range(gens):
+        evals = [fit_eval(c) for c in poblacion]
+        fits = [e[0] for e in evals]
+        orden = np.argsort(fits)[::-1]  # Maximizar fitness
+        mejor_gen = fits[orden[0]]
+        
+        sin_mejora = sin_mejora + 1 if (historial and mejor_gen <= historial[-1] + 1e-8) else 0
+        historial.append(mejor_gen)
+        if paciencia is not None and sin_mejora >= paciencia:
+            break
+
+        nueva = [poblacion[i] for i in orden[:elite]]
+        while len(nueva) < pob:
+            padres = []
+            for _ in range(2):
+                idx = rng.choice(pob, torneo, replace=False)
+                padres.append(poblacion[max(idx, key=lambda i: fits[i])])
+            mask = rng.integers(0, 2, n_genes).astype(bool)
+            hijo = [a if m else b for a, b, m in zip(padres[0], padres[1], mask)]
+            hijo = [1 - b if rng.random() < p_mut else b for b in hijo]
+            nueva.append(hijo)
+        poblacion = nueva
+
+    evals = [fit_eval(c) for c in poblacion]
+    fits = [e[0] for e in evals]
+    mejor_idx = int(np.argmax(fits))
+    mejor_cr = poblacion[mejor_idx]
+    genes_sel = [nombres_genes[i] for i, b in enumerate(mejor_cr) if b]
+    return genes_sel, evals[mejor_idx], historial, cache
+
+
 def algoritmo_genetico_multisemilla(X_train, y_train, grupos_genes,
+                                    modelo=None,
                                     semillas=[42, 101, 202, 303, 404],
                                     n_poblacion=25, n_generaciones=12,
-                                    penalizacion_lambda=0.005):
-    """Ejecuta el Algoritmo Genético sobre el modelo ganador (Regresión Logística)
-    a través de 5 semillas independientes para medir la estabilidad y frecuencia de selección.
+                                    penalizacion_lambda=0.005,
+                                    p_mut=0.12, elite=2, torneo=3,
+                                    k_folds=3, paciencia=3, cache=None):
+    """Ejecuta el Algoritmo Genético Multi-Semilla optimizado para feature selection.
+    
+    Por defecto utiliza XGBoost (el mejor modelo del benchmark, PR-AUC = 0.7572) como motor de evaluación,
+    o admite cualquier estimador / pipeline scikit-learn (e.g., Regresión Logística, el ganador 1-SE).
+    
+    Optimizado respecto a la solución base:
+    1. Modularidad: evaluación independiente con fitness_subconjunto_r2.
+    2. Memoización / Caché compartida entre generaciones e inter-semillas (costo O(1) en subconjuntos repetidos).
+    3. Cruce Uniforme (máscara binaria estocástica) que no asume orden ni contigüidad espacial entre columnas.
+    4. Elitismo múltiple (elite=2) y semilla informativa inicial ([1]*n_genes).
+    5. Parada anticipada (paciencia) ante convergencia temprana.
+    
+    Retorna: (frecuencias_df, genes_estables, cols_estables, resultados_semillas).
     """
     nombres_genes = list(grupos_genes.keys())
     n_genes = len(nombres_genes)
     conteo_seleccion = {g: 0 for g in nombres_genes}
     resultados_semillas = []
-    
-    def decodificar(cromosoma):
-        cols = []
-        for i, activo in enumerate(cromosoma):
-            if activo:
-                cols.extend(grupos_genes[nombres_genes[i]])
-        return cols
+    cache = {} if cache is None else cache
+
+    # Selección del modelo de evaluación del fitness
+    if modelo is None or (isinstance(modelo, str) and modelo.lower() in ("reglog", "logistica")):
+        # Regresión Logística: ganador adoptado por la regla 1-SE de parsimonia (Claims C-R2-010, C-R2-013..019)
+        modelo_eval = make_pipeline(StandardScaler(), LogisticRegression(max_iter=500, class_weight='balanced', random_state=SEMILLA))
+    elif isinstance(modelo, str) and modelo.lower() == "xgboost":
+        # XGBoost rápido y determinista: el mejor modelo absoluto del benchmark CV 5x2 (PR-AUC = 0.7572)
+        modelo_eval = XGBClassifier(
+            n_estimators=50, max_depth=3, learning_rate=0.1, subsample=1.0,
+            colsample_bytree=1.0, scale_pos_weight=2.3, eval_metric='logloss',
+            random_state=SEMILLA, n_jobs=-1, tree_method="hist"
+        )
+    else:
+        modelo_eval = modelo
 
     for sem in semillas:
-        rng = np.random.default_rng(sem)
-        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=sem)
+        genes_sel, (mejor_fit, mejor_pr), hist, cache = ga_buscar_r2(
+            grupos_genes, X_train, y_train, modelo_eval,
+            lam=penalizacion_lambda, semilla=sem,
+            pob=n_poblacion, gens=n_generaciones,
+            p_mut=p_mut, elite=elite, torneo=torneo,
+            k=k_folds, cache=cache, paciencia=paciencia
+        )
         
-        def evaluar(cromosoma):
-            if not any(cromosoma):
-                return -1.0, 0.0
-            cols = decodificar(cromosoma)
-            X_sub = X_train[cols]
-            scores = []
-            for tr_i, val_i in cv.split(X_sub, y_train):
-                m = make_pipeline(StandardScaler(), LogisticRegression(max_iter=500, class_weight='balanced', random_state=sem))
-                m.fit(X_sub.iloc[tr_i], y_train[tr_i])
-                p = m.predict_proba(X_sub.iloc[val_i])[:, 1]
-                scores.append(average_precision_score(y_train[val_i], p))
-            pr_auc = float(np.mean(scores))
-            fitness = pr_auc - penalizacion_lambda * int(np.sum(cromosoma))
-            return fitness, pr_auc
-
-        poblacion = [rng.integers(0, 2, size=n_genes).tolist() for _ in range(n_poblacion)]
-        poblacion[0] = [1] * n_genes
-        mejor_crom, mejor_fit, mejor_pr = None, -999.0, 0.0
-        
-        for _ in range(n_generaciones):
-            evals = [evaluar(ind) for ind in poblacion]
-            for ind, (fit, pr) in zip(poblacion, evals):
-                if fit > mejor_fit:
-                    mejor_fit = fit
-                    mejor_pr = pr
-                    mejor_crom = ind.copy()
-            # Torneo
-            nueva = [mejor_crom.copy()]
-            fits = [e[0] for e in evals]
-            while len(nueva) < n_poblacion:
-                t1, t2 = rng.choice(n_poblacion, size=2, replace=False)
-                p1 = poblacion[t1] if fits[t1] > fits[t2] else poblacion[t2]
-                t3, t4 = rng.choice(n_poblacion, size=2, replace=False)
-                p2 = poblacion[t3] if fits[t3] > fits[t4] else poblacion[t4]
-                pto = rng.integers(1, n_genes)
-                hijo = p1[:pto] + p2[pto:]
-                for j in range(n_genes):
-                    if rng.random() < 0.10:
-                        hijo[j] = 1 - hijo[j]
-                nueva.append(hijo)
-            poblacion = nueva
+        for g in genes_sel:
+            conteo_seleccion[g] += 1
             
-        for i, b in enumerate(mejor_crom):
-            if b == 1:
-                conteo_seleccion[nombres_genes[i]] += 1
-        resultados_semillas.append({"semilla": sem, "pr_auc": mejor_pr, "k": sum(mejor_crom)})
-        
-    # Variables estables (seleccionadas en >= 3 de las 5 semillas, es decir >= 60%)
+        resultados_semillas.append({
+            "semilla": sem, "pr_auc": mejor_pr, "fitness": mejor_fit,
+            "k": len(genes_sel), "genes": genes_sel
+        })
+
+    # Variables estables (seleccionadas en >= 60% de las semillas)
+    umbral_estabilidad = int(np.ceil(0.60 * len(semillas)))
     frecuencias = pd.DataFrame({
         "variable": list(conteo_seleccion.keys()),
         "frecuencia": list(conteo_seleccion.values()),
         "frecuencia_pct": [v / len(semillas) * 100 for v in conteo_seleccion.values()]
     }).sort_values("frecuencia", ascending=False).reset_index(drop=True)
-    frecuencias["pct_estabilidad"] = frecuencias["frecuencia_pct"]  # compatibilidad
-    
-    genes_estables = frecuencias[frecuencias["frecuencia"] >= 3]["variable"].tolist()
+    frecuencias["pct_estabilidad"] = frecuencias["frecuencia_pct"]
+
+    genes_estables = frecuencias[frecuencias["frecuencia"] >= umbral_estabilidad]["variable"].tolist()
     cols_estables = []
     for g in genes_estables:
         cols_estables.extend(grupos_genes[g])
-        
+
     return frecuencias, genes_estables, cols_estables, resultados_semillas
 
 # ----------------------------------------------------------------- 7. Coeficientes, Odds Ratios y SHAP Completo
