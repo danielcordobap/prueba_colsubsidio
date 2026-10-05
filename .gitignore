@@ -1,0 +1,7 @@
+# Cachés de Python y checkpoints de Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Archivos temporales de PowerPoint abiertos
+~$*
