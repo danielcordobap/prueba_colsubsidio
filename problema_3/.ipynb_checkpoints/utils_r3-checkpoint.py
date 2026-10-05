@@ -550,6 +550,46 @@ def algoritmo_genetico_ts_horizonte12(df_feat, df_raw, semillas=[42, 101, 202], 
         "evaluaciones_unicas": len(cache)
     }
 
+def ajuste_ets_historico(df_raw):
+    """Ajuste del ETS Aditivo contra la serie real, para que el lector vea qué tan bien sigue al recaudo.
+    - 'ajuste': valores ajustados dentro de la muestra (ETS entrenado con toda la historia, un paso adelante).
+    - 'backtest_2025': pronóstico de los 12 meses de 2025 con el ETS entrenado SOLO hasta 2024 (sin ver 2025): es la prueba honesta.
+    El MAPE del ajuste excluye el primer año (el modelo aún está inicializando)."""
+    y = df_raw[COL_OBJ_R3].astype(float)
+    hw = ExponentialSmoothing(y, trend="add", seasonal="add", seasonal_periods=12).fit()
+    ajuste = hw.fittedvalues
+    o = len(y) - 12
+    hw_bt = ExponentialSmoothing(y.iloc[:o], trend="add", seasonal="add", seasonal_periods=12).fit()
+    backtest = hw_bt.forecast(12)
+    mape = lambda real, pred: float(np.mean(np.abs((real - pred) / real)) * 100)
+    return {"ajuste": ajuste, "backtest_2025": backtest,
+            "mape_ajuste": mape(y.iloc[12:], ajuste.iloc[12:]), "mape_backtest_2025": mape(y.iloc[o:], backtest)}
+
+
+def diagnostico_ga_ts(df_feat, df_raw, vars_ga, n_aleatorios=150, semilla=0):
+    """Prueba de realidad del GA de series: ¿las variables elegidas rinden más que el mismo número de variables al azar?
+    Mismo protocolo del hold-out 2025 (XGBoost sobre el ratio interanual). Devuelve el MAPE del GA, el de los subconjuntos
+    aleatorios y la importancia de cada variable elegida (para detectar variables que solo funcionan como proxy de tendencia)."""
+    y_raw = df_raw[COL_OBJ_R3].astype(float)
+    features_cols = [c for c in df_feat.columns if c not in [COL_OBJ_R3, "ratio_anual"]]
+    o = len(y_raw) - 12
+    tr = df_feat.index < y_raw.index[o]
+    te = df_feat.index >= y_raw.index[o]
+    lag12, real = y_raw.iloc[o - 12:o].values, y_raw.iloc[o:].values
+
+    def ajustar(cols):
+        m = XGBRegressor(n_estimators=100, max_depth=3, learning_rate=0.05, random_state=SEMILLA, n_jobs=1)
+        m.fit(df_feat.loc[tr, cols], df_feat.loc[tr, "ratio_anual"])
+        p = m.predict(df_feat.loc[te, cols]) * lag12
+        return float(np.mean(np.abs((real - p) / real)) * 100), m
+
+    mape_ga, modelo_ga = ajustar(list(vars_ga))
+    rng = np.random.default_rng(semilla)
+    mapes_azar = np.array([ajustar(list(rng.choice(features_cols, len(vars_ga), replace=False)))[0] for _ in range(n_aleatorios)])
+    return {"mape_ga": mape_ga, "mapes_azar": mapes_azar,
+            "importancias": pd.Series(modelo_ga.feature_importances_, index=list(vars_ga)).sort_values(ascending=False)}
+
+
 # ----------------------------------------------------------------- 6. Simulación de Trayectorias y Presupuesto
 def proyectar_recaudo_2026_trayectorias(df_raw, n_simulaciones=2000, semilla=SEMILLA):
     """Proyección oficial del presupuesto 2026:
@@ -578,7 +618,10 @@ def proyectar_recaudo_2026_trayectorias(df_raw, n_simulaciones=2000, semilla=SEM
     ic80_inf_ets = float(np.percentile(totales_anuales_ets, 10))
     ic80_sup_ets = float(np.percentile(totales_anuales_ets, 90))
     mediana_anual_ets = float(np.median(totales_anuales_ets))
-    
+    sim_ets_mensual = np.asarray(sim_ets).reshape(12, -1)          # 12 meses x trayectorias
+    ets_mensual_inf = np.percentile(sim_ets_mensual, 10, axis=1)   # banda mensual 80 % del ETS
+    ets_mensual_sup = np.percentile(sim_ets_mensual, 90, axis=1)
+
     # Simulación de trayectorias conjuntas SARIMAX (Operativo Dinámico)
     rng_smx = np.random.default_rng(semilla)
     simulaciones_smx = modelo_smx.simulate(nsimulations=12, repetitions=n_simulaciones, anchor="end", rng=rng_smx)
@@ -635,7 +678,9 @@ def proyectar_recaudo_2026_trayectorias(df_raw, n_simulaciones=2000, semilla=SEM
         "ic80_sup_smx": ic80_sup_smx,
         "mediana_simulada": mediana_anual_ets,
         "pred_ets": pred_ets,
-        "pred_sarimax": pred_smx
+        "pred_sarimax": pred_smx,
+        "ets_mensual_inf": ets_mensual_inf,
+        "ets_mensual_sup": ets_mensual_sup
     }
 
 def proyectar_con_simulacion(y_serie, n_simulaciones=2000, semilla=SEMILLA):
